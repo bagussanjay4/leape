@@ -1,68 +1,35 @@
 <?php
-require 'vendor/autoload.php'; // pastikan PhpSpreadsheet sudah diinstall via Composer
+// download_template_xlsx.php
+require __DIR__ . '/vendor/autoload.php';
 
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
-use PhpOffice\PhpSpreadsheet\Style\Fill;
-use PhpOffice\PhpSpreadsheet\Style\Border;
 
-// Koneksi DB
-$db = new PDO("mysql:host=localhost;dbname=book_management_system;charset=utf8mb4", 'root', '');
-$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$ss = new Spreadsheet();
+$sheet = $ss->getActiveSheet();
 
-// Ambil data user
-$stmt = $db->query("SELECT name, email, kelas, 
-    (SELECT level FROM book_levels bl 
-     JOIN user_books ub ON ub.book_level_id = bl.id 
-     WHERE ub.user_id = users.id LIMIT 1) AS level
-    FROM users");
-$data = $stmt->fetchAll(PDO::FETCH_ASSOC);
+// Header WAJIB (case bebas): Name, Email, Kelas, Level
+$sheet->setCellValue('A1', 'Name');
+$sheet->setCellValue('B1', 'Email');
+$sheet->setCellValue('C1', 'Kelas'); // harus sama dengan categories.name
+$sheet->setCellValue('D1', 'Level'); // angka (opsional)
 
-// Buat spreadsheet baru
-$spreadsheet = new Spreadsheet();
-$sheet = $spreadsheet->getActiveSheet();
+// Contoh data (boleh dihapus)
+$sheet->fromArray([
+    ['Budi', 'budi@example.com', 'Kids', 1],
+    ['Sari', 'sari@example.com', 'Teens', 2],
+    ['Andi', 'andi@example.com', 'Adults', ''],
+], null, 'A2', true);
 
-// Header
-$headers = ['Name', 'Email', 'Kelas', 'Level'];
-$sheet->fromArray($headers, NULL, 'A1');
-
-// Isi data mulai dari baris ke-2
-$rowNum = 2;
-foreach ($data as $row) {
-    $sheet->setCellValue("A$rowNum", $row['name']);
-    $sheet->setCellValue("B$rowNum", $row['email']);
-    $sheet->setCellValue("C$rowNum", $row['kelas']);
-    $sheet->setCellValue("D$rowNum", $row['level']);
-    $rowNum++;
+// Styling ringan
+$sheet->getStyle('A1:D1')->getFont()->setBold(true);
+foreach (['A'=>22,'B'=>30,'C'=>18,'D'=>10] as $col=>$w) {
+    $sheet->getColumnDimension($col)->setWidth($w);
 }
 
-// Styling header
-$sheet->getStyle('A1:D1')->applyFromArray([
-    'font' => ['bold' => true, 'color' => ['rgb' => 'FFFFFF']],
-    'fill' => ['fillType' => Fill::FILL_SOLID, 'color' => ['rgb' => '0B3A6F']],
-    'alignment' => ['horizontal' => 'center']
-]);
-
-// Border semua sel
-$sheet->getStyle("A1:D" . ($rowNum - 1))->applyFromArray([
-    'borders' => [
-        'allBorders' => [
-            'borderStyle' => Border::BORDER_THIN,
-            'color' => ['rgb' => '000000']
-        ]
-    ]
-]);
-
-// Lebar kolom otomatis
-foreach (range('A', 'D') as $col) {
-    $sheet->getColumnDimension($col)->setAutoSize(true);
-}
-
-// Output sebagai XLSX
+// Output file
 header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-header('Content-Disposition: attachment; filename="template_pengguna.xlsx"');
-header('Cache-Control: max-age=0');
-
-$writer = new Xlsx($spreadsheet);
+header('Content-Disposition: attachment; filename="Template_Import_Users.xlsx"');
+$writer = new Xlsx($ss);
 $writer->save('php://output');
 exit;

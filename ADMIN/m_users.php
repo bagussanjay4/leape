@@ -21,21 +21,6 @@ try {
 /* ====== (Opsional) Cek Login ====== */
 // if (!isset($_SESSION['admin_logged_in'])) { header("Location: index.php"); exit; }
 
-/* ====== Composer autoload (untuk import XLSX/CSV) ====== */
-  use PhpOffice\PhpSpreadsheet\IOFactory;
-    use PhpOffice\PhpSpreadsheet\Reader\Csv as CsvReader;
-    use PhpOffice\PhpSpreadsheet\Reader\Xlsx as XlsxReader;
-
-if (isset($_POST['import_csv'])) {
-    $vendorAutoload = __DIR__ . '/vendor/autoload.php';
-    if (file_exists($vendorAutoload)) {
-        require $vendorAutoload;
-        // Gunakan reader spesifik agar tak perlu IOFactory
-    } else {
-        // Kalau belum install library, tombol import tetap muncul, tetapi nanti akan ditolak saat submit
-    }
-}
-
 /* ====== Helper Kategori & Level ====== */
 function get_category_by_id(PDO $db, int $id) {
     $s = $db->prepare("SELECT id, name FROM categories WHERE id=?");
@@ -47,12 +32,8 @@ function get_category_by_name(PDO $db, string $name) {
     $s->execute([$name]);
     return $s->fetch() ?: null;
 }
-function get_level_id_by_category_and_number(PDO $db, int $catId, int $levelNumber) {
-    $s = $db->prepare("SELECT id FROM book_levels WHERE category_id=? AND level=?");
-    $s->execute([$catId, $levelNumber]);
-    $r = $s->fetch();
-    return $r ? (int)$r['id'] : 0;
-}
+
+$error = ''; // init biar aman
 
 /* ====== Data referensi untuk UI ====== */
 $categories = $db->query("SELECT id, name FROM categories ORDER BY name")->fetchAll();
@@ -86,11 +67,9 @@ if (isset($_POST['add_user'])) {
         }
 
         // Pastikan email unik
-        $cek = $db->prepare("SELECT id FROM users WHERE email=?");
+        $cek = $db->prepare("SELECT id FROM users WHERE LOWER(email)=LOWER(?)");
         $cek->execute([$email]);
-        if ($cek->fetch()) {
-            throw new Exception("Email sudah terdaftar: " . $email);
-        }
+        if ($cek->fetch()) throw new Exception("Email sudah terdaftar: ".$email);
 
         $cat = get_category_by_id($db, $kelas_id);
         if (!$cat) throw new Exception("Kategori tidak ditemukan.");
@@ -100,7 +79,7 @@ if (isset($_POST['add_user'])) {
         $uid = (int)$db->lastInsertId();
 
         if ($level_id > 0) {
-            // Validasi level untuk kategori itu
+            // validasi level utk kategori yg dipilih
             $v = $db->prepare("SELECT COUNT(*) FROM book_levels WHERE id=? AND category_id=?");
             $v->execute([$level_id, $kelas_id]);
             if (!$v->fetchColumn()) throw new Exception("Level tidak valid untuk kategori terpilih.");
@@ -130,9 +109,9 @@ if (isset($_GET['delete_user'])) {
 
 /* Bulk ubah kelas & level (via modal + checklist) */
 if (isset($_POST['bulk_update_class_level'])) {
-    $ids         = isset($_POST['user_ids']) && is_array($_POST['user_ids']) ? array_map('intval', $_POST['user_ids']) : [];
-    $new_kelas_id= (int)($_POST['new_kelas_id'] ?? 0);
-    $new_level_id= (int)($_POST['new_level_id'] ?? 0);
+    $ids          = isset($_POST['user_ids']) && is_array($_POST['user_ids']) ? array_map('intval', $_POST['user_ids']) : [];
+    $new_kelas_id = (int)($_POST['new_kelas_id'] ?? 0);
+    $new_level_id = (int)($_POST['new_level_id'] ?? 0);
 
     try {
         if (empty($ids))      throw new Exception("Tidak ada pengguna dipilih.");
@@ -154,7 +133,7 @@ if (isset($_POST['bulk_update_class_level'])) {
         $rows = $db->prepare("SELECT id, kelas FROM users WHERE id IN ($in)");
         $rows->execute($ids);
         $byId = [];
-        foreach ($rows as $r) { $byId[(int)$r['id']] = $r['kelas']; }
+        foreach ($rows as $r) $byId[(int)$r['id']] = $r['kelas'];
 
         foreach ($ids as $uid) {
             $oldName = $byId[$uid] ?? '';
@@ -173,7 +152,7 @@ if (isset($_POST['bulk_update_class_level'])) {
                 ")->execute([$uid, $oldCatId]);
             }
 
-            // Upsert assignment pada kategori baru bila level dipilih
+            // Upsert assignment utk kategori baru bila level dipilih
             if ($new_level_id > 0) {
                 $upd = $db->prepare("
                     UPDATE user_books ub
@@ -199,165 +178,211 @@ if (isset($_POST['bulk_update_class_level'])) {
     }
 }
 
-/* ================ IMPORT CSV/XLSX ================ */
+/* ================ IMPORT CSV/XLSX (robust header) ================ */
 if (isset($_POST['import_csv'])) {
-    require __DIR__ . '/vendor/autoload.php';
-
-    // helpers
-    $getCategoryByName = function (PDO $db, string $name) {
-        $q = $db->prepare("SELECT id,name FROM categories WHERE name = ?");
-        $q->execute([$name]);
-        return $q->fetch(PDO::FETCH_ASSOC) ?: null;
-    };
-
-    // counters
-    $cntAdd = $cntUpd = $cntLevel = $cntSkip = 0;
-
     try {
-        if (
-            !isset($_FILES['csv_file']) ||
-            !is_uploaded_file($_FILES['csv_file']['tmp_name'])
-        ) {
-            throw new Exception('File tidak ditemukan.');
+        // 1) Check if vendor directory exists
+        $autoload = __DIR__.'/vendor/autoload.php';
+        if (!file_exists($autoload)) {
+            throw new Exception("Sistem import membutuhkan library PhpSpreadsheet. Silakan hubungi administrator untuk menginstal dependency.");
+        }
+        require $autoload;
+
+        // 2) Validate uploaded file
+        if (!isset($_FILES['csv_file']) || $_FILES['csv_file']['error'] !== UPLOAD_ERR_OK) {
+            throw new Exception('Silakan pilih file yang valid untuk diimport.');
         }
 
         $tmpPath = $_FILES['csv_file']['tmp_name'];
-        $orig    = $_FILES['csv_file']['name'];
-        $ext     = strtolower(pathinfo($orig, PATHINFO_EXTENSION));
+        $origName = $_FILES['csv_file']['name'];
+        $ext = strtolower(pathinfo($origName, PATHINFO_EXTENSION));
 
-        // pick reader
-        if ($ext === 'csv') {
-            $reader = new CsvReader();
-            $reader->setInputEncoding('UTF-8');
-            $reader->setDelimiter(',');
-        } elseif ($ext === 'xlsx') {
-            $reader = new XlsxReader();
-        } else {
-            throw new Exception('Format tidak didukung. Gunakan CSV atau XLSX.');
+        // 3) Validate file extension
+        if (!in_array($ext, ['csv', 'xlsx'])) {
+            throw new Exception('Format file tidak didukung. Hanya file CSV atau XLSX yang diterima.');
         }
-        // read only values (no styles/formulas)
+
+        // 4) Create appropriate reader
+        if ($ext === 'csv') {
+            $reader = new \PhpOffice\PhpSpreadsheet\Reader\Csv();
+            $reader->setInputEncoding('UTF-8');
+            
+            // Auto-detect delimiter
+            $sample = file_get_contents($tmpPath, false, null, 0, 4096) ?: '';
+            $delimiters = [',', ';', "\t"];
+            $bestDelimiter = ',';
+            $bestCount = 0;
+            
+            foreach ($delimiters as $delimiter) {
+                $count = substr_count(strtok($sample, "\n"), $delimiter);
+                if ($count > $bestCount) {
+                    $bestCount = $count;
+                    $bestDelimiter = $delimiter;
+                }
+            }
+            
+            $reader->setDelimiter($bestDelimiter);
+            $reader->setEnclosure('"');
+        } else {
+            $reader = new \PhpOffice\PhpSpreadsheet\Reader\Xlsx();
+        }
+        
         $reader->setReadDataOnly(true);
 
+        // 5) Load spreadsheet
         $spreadsheet = $reader->load($tmpPath);
-        $sheet       = $spreadsheet->getActiveSheet();
-        $rows        = $sheet->toArray(null, true, true, true); // indexed by column letters
+        $sheet = $spreadsheet->getActiveSheet();
+        $rows = $sheet->toArray(null, true, true, true);
 
-        if (!$rows || count($rows) < 2) {
-            throw new Exception('File kosong atau tidak ada data.');
+        if (count($rows) < 2) {
+            throw new Exception('File tidak berisi data atau format tidak sesuai.');
         }
 
-        // --- header mapping (robust) ---
-        $header = array_shift($rows); // first row
-        $map = ['name'=>null, 'email'=>null, 'kelas'=>null, 'level'=>null];
-        foreach ($header as $colLetter => $colName) {
-            $k = strtolower(trim((string)$colName));
-            if (isset($map[$k])) $map[$k] = $colLetter;
+        // 6) Normalize and find header row
+        $headerRow = null;
+        $headerMap = ['name' => null, 'email' => null, 'kelas' => null, 'level' => null];
+        
+        // Scan first 5 rows for headers
+        for ($i = 1; $i <= 5; $i++) {
+            if (!isset($rows[$i])) continue;
+            
+            $normalized = array_map(function($val) {
+                $val = trim(strtolower(preg_replace('/[\x00-\x1F\x80-\xFF]/', '', $val)));
+                return $val;
+            }, $rows[$i]);
+            
+            // Check if this row contains our required headers
+            foreach ($normalized as $col => $value) {
+                if (in_array($value, ['name', 'nama'])) $headerMap['name'] = $col;
+                if (in_array($value, ['email', 'e-mail'])) $headerMap['email'] = $col;
+                if (in_array($value, ['kelas', 'class', 'kategori', 'category'])) $headerMap['kelas'] = $col;
+                if (in_array($value, ['level', 'tingkat'])) $headerMap['level'] = $col;
+            }
+            
+            // We need at least email to proceed
+            if ($headerMap['email'] !== null) {
+                $headerRow = $i;
+                break;
+            }
         }
-        if ($map['email'] === null) {
-            throw new Exception('Kolom "email" wajib ada pada header (name,email,kelas,level).');
+
+        if ($headerRow === null) {
+            throw new Exception('Format header tidak valid. Pastikan file memiliki kolom "email".');
         }
-        // kelas & level opsional, tapi kalau diisi harus valid
 
-        // prepared statements reused
-        $selUser = $db->prepare("SELECT id,name,kelas FROM users WHERE LOWER(email)=LOWER(?)");
-        $insUser = $db->prepare("INSERT INTO users (name,email,password,kelas) VALUES (?,?,?,?)");
-        $updUser = $db->prepare("UPDATE users SET name=?, kelas=? WHERE id=?");
-
-        $checkLevel = $db->prepare("SELECT id, category_id FROM book_levels WHERE category_id=? AND level=?");
-        $updAssign  = $db->prepare("
+        // 7) Prepare database operations
+        $db->beginTransaction();
+        
+        // Prepare statements
+        $selUser = $db->prepare("SELECT id, name, kelas FROM users WHERE LOWER(email) = LOWER(?)");
+        $insUser = $db->prepare("INSERT INTO users (name, email, password, kelas) VALUES (?, ?, ?, ?)");
+        $updUser = $db->prepare("UPDATE users SET name = ?, kelas = ? WHERE id = ?");
+        
+        $selCat = $db->prepare("SELECT id FROM categories WHERE name = ?");
+        $selLevel = $db->prepare("SELECT id FROM book_levels WHERE category_id = ? AND level = ?");
+        $updAssign = $db->prepare("
             UPDATE user_books ub
             JOIN book_levels bl ON bl.id = ub.book_level_id
-            SET ub.book_level_id = :new_level
-            WHERE ub.user_id = :uid AND bl.category_id = :cat_id
+            SET ub.book_level_id = ? 
+            WHERE ub.user_id = ? AND bl.category_id = ?
         ");
-        $insAssign  = $db->prepare("INSERT INTO user_books (user_id, book_level_id) VALUES (?, ?)");
+        $insAssign = $db->prepare("INSERT INTO user_books (user_id, book_level_id) VALUES (?, ?)");
 
-        $db->beginTransaction();
-
-        foreach ($rows as $r) {
-            // normalize row values (trim; cast to string)
-            $val = function($letter) use ($r) {
-                return isset($r[$letter]) ? trim((string)$r[$letter]) : '';
-            };
-            $name  = $map['name']  ? $val($map['name'])  : '';
-            $email = $val($map['email']);
-            $kelas = $map['kelas'] ? $val($map['kelas']) : '';
-            $level = $map['level'] ? $val($map['level']) : '';
-
-            // skip rows without valid email
-            if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
-                $cntSkip++; continue;
+        // 8) Process rows
+        $counts = ['add' => 0, 'update' => 0, 'level' => 0, 'skip' => 0];
+        $startRow = $headerRow + 1;
+        
+        for ($i = $startRow; $i <= count($rows); $i++) {
+            if (!isset($rows[$i])) continue;
+            
+            $row = $rows[$i];
+            
+            // Get values from mapped columns
+            $email = isset($headerMap['email'], $row[$headerMap['email']]) 
+                   ? trim(strtolower($row[$headerMap['email']])) 
+                   : '';
+            $name = isset($headerMap['name'], $row[$headerMap['name']]) 
+                  ? trim($row[$headerMap['name']]) 
+                  : '';
+            $kelas = isset($headerMap['kelas'], $row[$headerMap['kelas']]) 
+                   ? trim($row[$headerMap['kelas']]) 
+                   : '';
+            $level = isset($headerMap['level'], $row[$headerMap['level']]) 
+                   ? trim($row[$headerMap['level']]) 
+                   : '';
+            
+            // Skip if no email or invalid email
+            if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $counts['skip']++;
+                continue;
             }
-
-            // sanitize case/whitespace
-            $email = strtolower($email);
-            if ($kelas !== '') $kelas = trim($kelas);
-            if ($level !== '') $level = (string)(int)$level; // coerce numeric text to int-string
-
-            // --- UPSERT user by email ---
+            
+            // Check if user exists
             $selUser->execute([$email]);
-            $user = $selUser->fetch(PDO::FETCH_ASSOC);
-
-            $targetKelasName = $kelas !== '' ? $kelas : ($user['kelas'] ?? ''); // if kelas omitted, keep existing
-            $targetKelasName = trim($targetKelasName);
-
+            $user = $selUser->fetch();
+            
+            // Determine kelas to use (new or existing)
+            $kelasToUse = $kelas !== '' ? $kelas : ($user['kelas'] ?? '');
+            
             if ($user) {
-                // update name/kelas if provided/changed
-                $newName  = ($name !== '') ? $name : $user['name'];
-                $newKelas = ($targetKelasName !== '') ? $targetKelasName : $user['kelas'];
+                // Update existing user if name or kelas changed
+                $newName = $name !== '' ? $name : $user['name'];
+                $newKelas = $kelasToUse !== '' ? $kelasToUse : $user['kelas'];
+                
                 if ($newName !== $user['name'] || $newKelas !== $user['kelas']) {
-                    $updUser->execute([$newName, $newKelas, (int)$user['id']]);
-                    $cntUpd++;
-                    $user['name']  = $newName;
-                    $user['kelas'] = $newKelas;
+                    $updUser->execute([$newName, $newKelas, $user['id']]);
+                    $counts['update']++;
                 }
                 $uid = (int)$user['id'];
             } else {
-                // insert new user
-                $kelasToInsert = $targetKelasName;       // may be blank (allowed)
-                $password      = 'Leap1234';
-                $insUser->execute([$name, $email, $password, $kelasToInsert]);
-                $uid = (int)$db->lastInsertId();
-                $cntAdd++;
-                $user = ['id'=>$uid, 'kelas'=>$kelasToInsert];
-            }
-
-            // --- optional: set/replace level when both kelas & level are provided ---
-            if ($targetKelasName !== '' && $level !== '' && (int)$level > 0) {
-                // find category id by kelas name
-                $cat = $getCategoryByName($db, $targetKelasName);
-                if (!$cat) { $cntSkip++; continue; } // kelas tidak valid di DB
-
-                // find level id for that category+level number
-                $checkLevel->execute([(int)$cat['id'], (int)$level]);
-                $lv = $checkLevel->fetch(PDO::FETCH_ASSOC);
-                if (!$lv) { $cntSkip++; continue; }
-
-                // upsert assignment (no duplicate key crash)
-                $updAssign->execute([
-                    ':new_level' => (int)$lv['id'],
-                    ':uid'       => $uid,
-                    ':cat_id'    => (int)$cat['id'],
-                ]);
-                if ($updAssign->rowCount() === 0) {
-                    // not exists -> insert
-                    $insAssign->execute([$uid, (int)$lv['id']]);
+                // Insert new user
+                if ($name === '') {
+                    $counts['skip']++;
+                    continue;
                 }
-                $cntLevel++;
+                
+                $insUser->execute([$name, $email, 'Leap1234', $kelasToUse]);
+                $uid = (int)$db->lastInsertId();
+                $counts['add']++;
+            }
+            
+            // Process level assignment if kelas and level provided
+            if ($kelasToUse !== '' && $level !== '' && is_numeric($level)) {
+                $selCat->execute([$kelasToUse]);
+                $cat = $selCat->fetch();
+                
+                if ($cat) {
+                    $selLevel->execute([(int)$cat['id'], (int)$level]);
+                    $levelData = $selLevel->fetch();
+                    
+                    if ($levelData) {
+                        $updAssign->execute([(int)$levelData['id'], $uid, (int)$cat['id']]);
+                        if ($updAssign->rowCount() === 0) {
+                            $insAssign->execute([$uid, (int)$levelData['id']]);
+                        }
+                        $counts['level']++;
+                    }
+                }
             }
         }
-
+        
         $db->commit();
-        $_SESSION['success_message'] =
-            "Import selesai. Tambah: {$cntAdd}, update: {$cntUpd}, set level: {$cntLevel}, dilewati: {$cntSkip}.";
-        header("Location: m_users.php"); exit;
-
-    } catch (Throwable $e) {
-        if ($db->inTransaction()) $db->rollBack();
-        $error = "Gagal import: " . $e->getMessage();
+        
+        $_SESSION['success_message'] = sprintf(
+            "Import berhasil! Ditambahkan: %d, Diupdate: %d, Level diatur: %d, Dilewati: %d",
+            $counts['add'], $counts['update'], $counts['level'], $counts['skip']
+        );
+        
+        header("Location: m_users.php");
+        exit;
+        
+    } catch (Exception $e) {
+        if (isset($db) && $db->inTransaction()) {
+            $db->rollBack();
+        }
+        $error = "Gagal mengimport data: " . $e->getMessage();
     }
 }
-
 
 /* =========================================================
    FILTER & PAGINATION
@@ -587,7 +612,7 @@ body{background:var(--bg);font-family:Segoe UI,system-ui,-apple-system,Roboto,Ar
                 </li>
               <?php endfor; ?>
               <li class="page-item <?= $page>=$totalPages?'disabled':'' ?>">
-                <a class="page-link" href="<?= $page>=$totalPages?'#':build_url(['page'=>$page+1]) ?>">Next</a>
+                <a class="page-link" href="<?= $page>>= $totalPages?'#':build_url(['page'=>$page+1]) ?>">Next</a>
               </li>
             </ul>
           </nav>
@@ -608,11 +633,11 @@ body{background:var(--bg);font-family:Segoe UI,system-ui,-apple-system,Roboto,Ar
         <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
       </div>
       <div class="modal-body">
-        <p class="mb-2">Format header: <code>Name,Email,Kelas,Level</code></p>
+        <p class="mb-2">Format header: <code>Name, Email, Kelas, Level</code> (case bebas).</p>
         <ul class="small mb-3">
-          <li><b>Email</b> jadi kunci unik (1 email hanya 1 user). Jika ada, user di-<em>update</em> namanya/kelasnya.</li>
+          <li><b>Email</b> jadi kunci unik. Kalau sudah ada → data di-<em>update</em>.</li>
           <li><b>Kelas</b> harus sama dengan nama kategori di <em>Manage Books</em>.</li>
-          <li><b>Level</b> opsional (angka). Jika diisi, sistem akan <em>upsert</em> penugasan level di kategori itu.</li>
+          <li><b>Level</b> opsional (angka). Jika diisi dan valid → assignment level di-<em>upsert</em>.</li>
         </ul>
         <div class="mb-3">
           <label class="form-label">Pilih file (.csv/.xlsx)</label>
